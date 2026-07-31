@@ -1,0 +1,14 @@
+{
+  "name": "imap-bridge",
+  "version": "1.0.0",
+  "description": "Puente IMAP -> HTTP para Base44 (lectura de correos de compras/gastos)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "imapflow": "^1.0.129",
+    "mailparser": "^3.6.5"
+  }
+}
