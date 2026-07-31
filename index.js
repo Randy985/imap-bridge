@@ -35,17 +35,41 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/test', authToken, async (req, res) => {
   let client;
+
   try {
     client = createClient(req.body);
+
     await client.connect();
-    const lock = await client.getMailboxLock(IMAP_MAILBOX);
-    let status;
-    try { status = await client.status(IMAP_MAILBOX, { messages: true, unseen: true }); } finally { lock.release(); }
+
+    const status = await client.status(IMAP_MAILBOX, {
+      messages: true,
+      unseen: true
+    });
+
     await client.logout();
-    res.json({ success: true, message: 'Conexion IMAP exitosa', mailbox: IMAP_MAILBOX, total_messages: status.messages, unseen: status.unseen });
+
+    return res.json({
+      success: true,
+      message: 'Conexion IMAP exitosa',
+      mailbox: IMAP_MAILBOX,
+      total_messages: status.messages,
+      unseen: status.unseen
+    });
   } catch (err) {
-    if (client) try { await client.logout(); } catch (e) {}
-    res.status(500).json({ success: false, error: err.message });
+    console.error('Error IMAP:', err);
+
+    if (client) {
+      try {
+        await client.logout();
+      } catch (_) {}
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+      code: err.code || null,
+      responseCode: err.responseCode || null
+    });
   }
 });
 
