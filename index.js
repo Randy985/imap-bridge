@@ -1,126 +1,366 @@
+const crypto = require('crypto');
 const express = require('express');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
+
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 
-const PORT = process.env.PORT || 3000;
-const IMAP_HOST = process.env.IMAP_HOST;
-const IMAP_PORT = parseInt(process.env.IMAP_PORT || '993', 10);
-const IMAP_USER = process.env.IMAP_USER;
-const IMAP_PASS = process.env.IMAP_PASS;
-const IMAP_MAILBOX = process.env.IMAP_MAILBOX || 'INBOX';
+const PORT = Number(process.env.PORT || 3000);
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
+/**
+ * Compara tokens evitando comparaciones simples.
+ */
+function safeTokenEquals(receivedToken, expectedToken) {
+  if (!receivedToken || !expectedToken) {
+    return false;
+  }
+
+  const received = Buffer.from(receivedToken);
+  const expected = Buffer.from(expectedToken);
+
+  if (received.length !== expected.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(received, expected);
+}
+
+/**
+ * Protege todos los endpoints privados.
+ */
 function authToken(req, res, next) {
-  const token = req.headers['token'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (!SECRET_TOKEN) return res.status(500).json({ error: 'SECRET_TOKEN no configurado' });
-  if (token !== SECRET_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+  if (!SECRET_TOKEN) {
+    return res.status(500).json({
+      success: false,
+      error: 'SECRET_TOKEN no configurado'
+    });
+  }
+
+  const authorization = req.headers.authorization || '';
+  const bearerToken = authorization.startsWith('Bearer ')
+    ? authorization.slice(7).trim()
+    : null;
+
+  const token = req.headers.token || bearerToken;
+
+  if (!safeTokenEquals(token, SECRET_TOKEN)) {
+    return res.status(401).json({
+      success: false,
+      error: 'No autorizado'
+    });
+  }
+
   next();
 }
 
-function createClient(override) {
-  const host = override?.imap_host || IMAP_HOST;
-  const port = override?.imap_port ? parseInt(override.imap_port, 10) : IMAP_PORT;
-  const user = override?.imap_user || IMAP_USER;
-  const pass = override?.imap_pass || IMAP_PASS;
-  if (!host || !user || !pass) throw new Error('Faltan credenciales IMAP');
-  return new ImapFlow({ host, port, secure: port === 993, auth: { user, pass }, logger: false });
+/**
+ * Obtiene la configuración IMAP enviada por Base44.
+ *
+ * Body esperado:
+ * {
+ *   "imap": {
+ *     "host": "imap.hostinger.com",
+ *     "port": 993,
+ *     "user": "correo@dominio.com",
+ *     "pass": "contraseña-de-aplicacion",
+ *     "mailbox": "INBOX"
+ *   }
+ * }
+ */
+function getImapConfig(body = {}) {
+  const imap = body.imap || {};
+
+  const host = String(imap.host || '').trim();
+  const port = Number(imap.port || 993);
+  const user = String(imap.user || '').trim();
+  const pass = String(imap.pass || '');
+  const mailbox = String(imap.mailbox || 'INBOX').trim();
+
+  if (!host) {
+    throw new Error('imap.host requerido');
+  }
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('imap.port inválido');
+  }
+
+  if (!user) {
+    throw new Error('imap.user requerido');
+  }
+
+  if (!pass) {
+    throw new Error('imap.pass requerido');
+  }
+
+  if (!mailbox) {
+    throw new Error('imap.mailbox inválido');
+  }
+
+  return {
+    host,
+    port,
+    user,
+    pass,
+    mailbox
+  };
 }
 
+/**
+ * Crea un cliente distinto para cada solicitud/cuenta.
+ */
+function createClient(config) {
+  return new ImapFlow({
+    host: config.host,
+    port: config.port,
+    secure: config.port === 993,
+    auth: {
+      user: config.user,
+      pass: config.pass
+    },
+    logger: false,
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 60_000
+  });
+}
+
+/**
+ * Cierra el cliente sin ocultar el error original.
+ */
+async function closeClient(client) {
+  if (!client) {
+    return;
+  }
+
+  try {
+    await client.logout();
+  } catch (_) {
+    try {
+      client.close();
+    } catch (_) {
+      // Ignorar errores durante limpieza.
+    }
+  }
+}
+
+/**
+ * Endpoint público para verificar que Render está activo.
+ */
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', imap_host: IMAP_HOST ? 'configurado' : 'falta', token: SECRET_TOKEN ? 'configurado' : 'falta', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    mode: 'multi-account',
+    token_configured: Boolean(SECRET_TOKEN),
+    timestamp: new Date().toISOString()
+  });
 });
 
+/**
+ * Prueba una cuenta IMAP concreta.
+ */
 app.post('/api/test', authToken, async (req, res) => {
   let client;
 
   try {
-    client = createClient(req.body);
+    const config = getImapConfig(req.body);
+    client = createClient(config);
 
     await client.connect();
 
-    const status = await client.status(IMAP_MAILBOX, {
+    const status = await client.status(config.mailbox, {
       messages: true,
       unseen: true
     });
 
-    await client.logout();
+    await closeClient(client);
+    client = null;
 
     return res.json({
       success: true,
       message: 'Conexion IMAP exitosa',
-      mailbox: IMAP_MAILBOX,
+      mailbox: config.mailbox,
       total_messages: status.messages,
       unseen: status.unseen
     });
-  } catch (err) {
-    console.error('Error IMAP:', err);
+  } catch (error) {
+    console.error('IMAP test failed:', {
+      message: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
+    });
 
-    if (client) {
-      try {
-        await client.logout();
-      } catch (_) {}
-    }
+    await closeClient(client);
 
     return res.status(500).json({
       success: false,
-      error: err.message,
-      code: err.code || null,
-      responseCode: err.responseCode || null
+      error: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
     });
   }
 });
 
+/**
+ * Lee correos no leídos de la cuenta enviada.
+ */
 app.post('/api/inbox', authToken, async (req, res) => {
   let client;
+  let lock;
+
   try {
-    client = createClient(req.body);
+    const config = getImapConfig(req.body);
+
+    const requestedLimit = Number.parseInt(req.body.limit || '50', 10);
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 200)
+      : 50;
+
+    client = createClient(config);
     await client.connect();
-    const lock = await client.getMailboxLock(IMAP_MAILBOX);
-    let messages = [];
-    try {
-      const limit = Math.min(parseInt(req.body?.limit || '50', 10), 200);
-      for await (let msg of client.fetch({ seen: false }, { source: true, envelope: true, internalDate: true }, { uid: true })) {
-        const parsed = await simpleParser(msg.source);
-        const attachments = [];
-        if (parsed.attachments && parsed.attachments.length > 0) {
-          for (const att of parsed.attachments) {
-            attachments.push({ filename: att.filename, contentType: att.contentType, size: att.size, content_base64: att.content.toString('base64') });
-          }
+
+    lock = await client.getMailboxLock(config.mailbox);
+
+    const messages = [];
+
+    for await (
+      const message of client.fetch(
+        { seen: false },
+        {
+          source: true,
+          envelope: true,
+          internalDate: true
+        },
+        {
+          uid: true
         }
-        messages.push({ uid: msg.uid, internalDate: msg.internalDate, messageId: parsed.messageId, from: parsed.from?.text || '', to: parsed.to?.text || '', subject: parsed.subject || '', text: parsed.text || '', html: parsed.html || '', attachments });
-        if (messages.length >= limit) break;
+      )
+    ) {
+      const parsed = await simpleParser(message.source);
+
+      const attachments = (parsed.attachments || []).map((attachment) => ({
+        filename: attachment.filename || null,
+        contentType: attachment.contentType || 'application/octet-stream',
+        size: attachment.size || attachment.content?.length || 0,
+        content_base64: attachment.content.toString('base64')
+      }));
+
+      messages.push({
+        uid: message.uid,
+        internalDate: message.internalDate,
+        messageId: parsed.messageId || null,
+        from: parsed.from?.text || '',
+        to: parsed.to?.text || '',
+        subject: parsed.subject || '',
+        text: parsed.text || '',
+        html: parsed.html || '',
+        attachments
+      });
+
+      if (messages.length >= limit) {
+        break;
       }
-    } finally { lock.release(); }
-    await client.logout();
-    res.json({ success: true, count: messages.length, messages });
-  } catch (err) {
-    if (client) try { await client.logout(); } catch (e) {}
-    res.status(500).json({ success: false, error: err.message });
+    }
+
+    lock.release();
+    lock = null;
+
+    await closeClient(client);
+    client = null;
+
+    return res.json({
+      success: true,
+      count: messages.length,
+      messages
+    });
+  } catch (error) {
+    console.error('IMAP inbox failed:', {
+      message: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
+    });
+
+    if (lock) {
+      try {
+        lock.release();
+      } catch (_) { }
+    }
+
+    await closeClient(client);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
+    });
   }
 });
 
+/**
+ * Marca un mensaje como leído en una cuenta concreta.
+ */
 app.post('/api/mark-read', authToken, async (req, res) => {
   let client;
+  let lock;
+
   try {
-    const uid = parseInt(req.body?.uid, 10);
-    if (!uid) return res.status(400).json({ error: 'uid requerido' });
-    client = createClient(req.body);
+    const config = getImapConfig(req.body);
+    const uid = Number.parseInt(req.body.uid, 10);
+
+    if (!Number.isInteger(uid) || uid <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'uid requerido'
+      });
+    }
+
+    client = createClient(config);
     await client.connect();
-    const lock = await client.getMailboxLock(IMAP_MAILBOX);
-    try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } finally { lock.release(); }
-    await client.logout();
-    res.json({ success: true, message: `UID ${uid} marcado como leido` });
-  } catch (err) {
-    if (client) try { await client.logout(); } catch (e) {}
-    res.status(500).json({ success: false, error: err.message });
+
+    lock = await client.getMailboxLock(config.mailbox);
+
+    await client.messageFlagsAdd(uid, ['\\Seen'], {
+      uid: true
+    });
+
+    lock.release();
+    lock = null;
+
+    await closeClient(client);
+    client = null;
+
+    return res.json({
+      success: true,
+      message: `UID ${uid} marcado como leido`
+    });
+  } catch (error) {
+    console.error('IMAP mark-read failed:', {
+      message: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
+    });
+
+    if (lock) {
+      try {
+        lock.release();
+      } catch (_) { }
+    }
+
+    await closeClient(client);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      code: error.code || null,
+      responseCode: error.responseCode || null
+    });
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`IMAP Bridge escuchando en puerto ${PORT}`);
-  console.log(`IMAP: ${IMAP_USER}@${IMAP_HOST}:${IMAP_PORT} [${IMAP_MAILBOX}]`);
+  console.log(`IMAP Bridge multi-account escuchando en puerto ${PORT}`);
   console.log(`Token: ${SECRET_TOKEN ? 'configurado' : 'NO configurado'}`);
 });
