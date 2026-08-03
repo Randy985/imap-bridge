@@ -201,9 +201,6 @@ app.post('/api/test', authToken, async (req, res) => {
   }
 });
 
-/**
- * Lee correos no leídos de una cuenta.
- */
 app.post('/api/inbox', authToken, async (req, res) => {
   let client;
   let lock;
@@ -212,66 +209,102 @@ app.post('/api/inbox', authToken, async (req, res) => {
     const config = getImapConfig(req.body);
 
     const requestedLimit = Number.parseInt(
-      String(req.body.limit || '50'),
+      String(req.body.limit || '10'),
       10
     );
 
     const limit = Number.isInteger(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 200)
-      : 50;
+      ? Math.min(Math.max(requestedLimit, 1), 10)
+      : 10;
 
     client = createClient(config);
-
     await client.connect();
 
     lock = await client.getMailboxLock(config.mailbox);
 
+    const unseenUids = await client.search(
+      { seen: false },
+      { uid: true }
+    );
+
+    const selectedUids = unseenUids.slice(-limit).reverse();
+
     const messages = [];
+    const failed = [];
 
-    for await (
-      const message of client.fetch(
-        {
-          seen: false
-        },
-        {
-          source: true,
-          envelope: true,
-          internalDate: true
-        },
-        {
-          uid: true
+    for (const uid of selectedUids) {
+      try {
+        const message = await Promise.race([
+          client.fetchOne(
+            uid,
+            {
+              source: true,
+              envelope: true,
+              internalDate: true
+            },
+            {
+              uid: true
+            }
+          ),
+          new Promise((_, reject) => {
+            setTimeout(() => {
+              reject(new Error('Timeout al descargar el correo'));
+            }, 15_000);
+          })
+        ]);
+
+        if (!message?.source) {
+          failed.push({
+            uid,
+            error: 'Correo sin contenido'
+          });
+
+          continue;
         }
-      )
-    ) {
-      const parsed = await simpleParser(message.source);
 
-      const attachments = (parsed.attachments || []).map((attachment) => ({
-        filename: attachment.filename || null,
-        contentType:
-          attachment.contentType || 'application/octet-stream',
-        size:
-          attachment.size ||
-          attachment.content?.length ||
-          0,
-        content_base64: attachment.content
-          ? attachment.content.toString('base64')
-          : ''
-      }));
+        const parsed = await Promise.race([
+          simpleParser(message.source),
+          new Promise((_, reject) => {
+            setTimeout(() => {
+              reject(new Error('Timeout al procesar el correo'));
+            }, 15_000);
+          })
+        ]);
 
-      messages.push({
-        uid: message.uid,
-        internalDate: message.internalDate,
-        messageId: parsed.messageId || null,
-        from: parsed.from?.text || '',
-        to: parsed.to?.text || '',
-        subject: parsed.subject || '',
-        text: parsed.text || '',
-        html: parsed.html || '',
-        attachments
-      });
+        const attachments = (parsed.attachments || []).map((attachment) => ({
+          filename: attachment.filename || null,
+          contentType:
+            attachment.contentType || 'application/octet-stream',
+          size:
+            attachment.size ||
+            attachment.content?.length ||
+            0,
+          content_base64: attachment.content
+            ? attachment.content.toString('base64')
+            : ''
+        }));
 
-      if (messages.length >= limit) {
-        break;
+        messages.push({
+          uid: message.uid,
+          internalDate: message.internalDate,
+          messageId: parsed.messageId || null,
+          from: parsed.from?.text || '',
+          to: parsed.to?.text || '',
+          subject: parsed.subject || '',
+          text: parsed.text || '',
+          html: parsed.html || '',
+          attachments
+        });
+      } catch (messageError) {
+        console.error('IMAP message failed:', {
+          uid,
+          message: messageError.message
+        });
+
+        failed.push({
+          uid,
+          error: messageError.message
+        });
       }
     }
 
@@ -284,6 +317,8 @@ app.post('/api/inbox', authToken, async (req, res) => {
     return res.json({
       success: true,
       count: messages.length,
+      failed_count: failed.length,
+      failed,
       messages
     });
   } catch (error) {
@@ -297,7 +332,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
       try {
         lock.release();
       } catch (_) {
-        // Ignorar errores de liberación.
+        // Ignorar error de liberación.
       }
     }
 
