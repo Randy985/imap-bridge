@@ -205,7 +205,6 @@ app.post('/api/test', authToken, async (req, res) => {
 
 /**
  * Lee correos no leídos de la cuenta enviada.
- * Primero obtiene los UID y después descarga únicamente el lote solicitado.
  */
 app.post('/api/inbox', authToken, async (req, res) => {
   let client;
@@ -214,82 +213,54 @@ app.post('/api/inbox', authToken, async (req, res) => {
   try {
     const config = getImapConfig(req.body);
 
-    const requestedLimit = Number.parseInt(req.body.limit || '10', 10);
+    const requestedLimit = Number.parseInt(req.body.limit || '50', 10);
     const limit = Number.isInteger(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 50)
-      : 10;
+      ? Math.min(Math.max(requestedLimit, 1), 200)
+      : 50;
 
     client = createClient(config);
     await client.connect();
 
     lock = await client.getMailboxLock(config.mailbox);
 
-    // Buscar solamente identificadores, sin descargar correos ni adjuntos.
-    const searchResult = await client.search(
-      { seen: false },
-      { uid: true }
-    );
-
-    const unseenUids = Array.isArray(searchResult)
-      ? searchResult
-      : [];
-
-    // Procesar primero los correos no leídos más antiguos.
-    const selectedUids = unseenUids.slice(0, limit);
     const messages = [];
 
-    if (selectedUids.length > 0) {
-      for await (
-        const message of client.fetch(
-          selectedUids,
-          {
-            source: true,
-            envelope: true,
-            internalDate: true
-          },
-          {
-            uid: true
-          }
-        )
-      ) {
-        try {
-          const parsed = await simpleParser(message.source);
-
-          const attachments = (parsed.attachments || []).map((attachment) => ({
-            filename: attachment.filename || null,
-            contentType:
-              attachment.contentType || 'application/octet-stream',
-            size:
-              attachment.size ||
-              attachment.content?.length ||
-              0,
-            content_base64: attachment.content
-              ? attachment.content.toString('base64')
-              : ''
-          }));
-
-          messages.push({
-            uid: message.uid,
-            internalDate: message.internalDate,
-            messageId: parsed.messageId || null,
-            from: parsed.from?.text || '',
-            to: parsed.to?.text || '',
-            subject: parsed.subject || '',
-            text: parsed.text || '',
-            html: parsed.html || '',
-            attachments
-          });
-        } catch (messageError) {
-          console.error('IMAP message parse failed:', {
-            uid: message.uid,
-            message: messageError.message
-          });
-
-          messages.push({
-            uid: message.uid,
-            error: 'No se pudo procesar el mensaje'
-          });
+    for await (
+      const message of client.fetch(
+        { seen: false },
+        {
+          source: true,
+          envelope: true,
+          internalDate: true
+        },
+        {
+          uid: true
         }
+      )
+    ) {
+      const parsed = await simpleParser(message.source);
+
+      const attachments = (parsed.attachments || []).map((attachment) => ({
+        filename: attachment.filename || null,
+        contentType: attachment.contentType || 'application/octet-stream',
+        size: attachment.size || attachment.content?.length || 0,
+        content_base64: attachment.content.toString('base64')
+      }));
+
+      messages.push({
+        uid: message.uid,
+        internalDate: message.internalDate,
+        messageId: parsed.messageId || null,
+        from: parsed.from?.text || '',
+        to: parsed.to?.text || '',
+        subject: parsed.subject || '',
+        text: parsed.text || '',
+        html: parsed.html || '',
+        attachments
+      });
+
+      if (messages.length >= limit) {
+        break;
       }
     }
 
@@ -302,8 +273,6 @@ app.post('/api/inbox', authToken, async (req, res) => {
     return res.json({
       success: true,
       count: messages.length,
-      total_unseen: unseenUids.length,
-      has_more: unseenUids.length > selectedUids.length,
       messages
     });
   } catch (error) {
@@ -316,9 +285,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
     if (lock) {
       try {
         lock.release();
-      } catch (_) {
-        // Ignorar errores durante limpieza.
-      }
+      } catch (_) {}
     }
 
     await closeClient(client);
