@@ -10,16 +10,13 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
-/**
- * Compara tokens de forma segura.
- */
 function safeTokenEquals(receivedToken, expectedToken) {
   if (!receivedToken || !expectedToken) {
     return false;
   }
 
-  const received = Buffer.from(receivedToken);
-  const expected = Buffer.from(expectedToken);
+  const received = Buffer.from(String(receivedToken));
+  const expected = Buffer.from(String(expectedToken));
 
   if (received.length !== expected.length) {
     return false;
@@ -28,9 +25,6 @@ function safeTokenEquals(receivedToken, expectedToken) {
   return crypto.timingSafeEqual(received, expected);
 }
 
-/**
- * Protege los endpoints privados.
- */
 function authToken(req, res, next) {
   if (!SECRET_TOKEN) {
     return res.status(500).json({
@@ -39,13 +33,13 @@ function authToken(req, res, next) {
     });
   }
 
-  const authorization = req.headers.authorization || '';
+  const authorization = String(req.headers.authorization || '');
 
   const bearerToken = authorization.startsWith('Bearer ')
     ? authorization.slice(7).trim()
-    : null;
+    : '';
 
-  const token = req.headers.token || bearerToken;
+  const token = String(req.headers.token || bearerToken || '');
 
   if (!safeTokenEquals(token, SECRET_TOKEN)) {
     return res.status(401).json({
@@ -57,9 +51,6 @@ function authToken(req, res, next) {
   next();
 }
 
-/**
- * Obtiene la configuración IMAP enviada por Base44.
- */
 function getImapConfig(body = {}) {
   const imap = body.imap || {};
 
@@ -98,9 +89,6 @@ function getImapConfig(body = {}) {
   };
 }
 
-/**
- * Crea una conexión IMAP independiente por solicitud.
- */
 function createClient(config) {
   return new ImapFlow({
     host: config.host,
@@ -113,13 +101,22 @@ function createClient(config) {
     logger: false,
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,
-    socketTimeout: 30_000
+    socketTimeout: 20_000
   });
 }
 
-/**
- * Cierra la conexión sin bloquear indefinidamente.
- */
+function forceCloseClient(client) {
+  if (!client) {
+    return;
+  }
+
+  try {
+    client.close();
+  } catch (_) {
+    // Ignorar errores de cierre forzado.
+  }
+}
+
 async function closeClient(client) {
   if (!client) {
     return;
@@ -131,21 +128,165 @@ async function closeClient(client) {
       new Promise((_, reject) => {
         setTimeout(() => {
           reject(new Error('IMAP logout timeout'));
-        }, 3_000);
+        }, 2_000);
       })
     ]);
   } catch (_) {
-    try {
-      client.close();
-    } catch (_) {
-      // Ignorar errores de cierre.
+    forceCloseClient(client);
+  }
+}
+
+async function runWithTimeout(operation, timeoutMs, onTimeout) {
+  let timeoutId;
+
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          try {
+            onTimeout?.();
+          } catch (_) {
+            // Ignorar errores durante cancelación.
+          }
+
+          reject(new Error(`Tiempo máximo excedido (${timeoutMs} ms)`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
     }
   }
 }
 
-/**
- * Verifica que el servicio esté activo.
- */
+async function searchUnreadUids(config, limit) {
+  let client;
+  let lock;
+
+  try {
+    client = createClient(config);
+
+    await runWithTimeout(
+      () => client.connect(),
+      12_000,
+      () => forceCloseClient(client)
+    );
+
+    lock = await runWithTimeout(
+      () => client.getMailboxLock(config.mailbox),
+      10_000,
+      () => forceCloseClient(client)
+    );
+
+    const uids = await runWithTimeout(
+      () => client.search({ seen: false }, { uid: true }),
+      15_000,
+      () => forceCloseClient(client)
+    );
+
+    const unreadUids = Array.isArray(uids) ? uids : [];
+
+    return unreadUids
+      .slice(-limit)
+      .reverse();
+  } finally {
+    if (lock) {
+      try {
+        lock.release();
+      } catch (_) {
+        // Ignorar errores de liberación.
+      }
+    }
+
+    await closeClient(client);
+  }
+}
+
+async function fetchMessageByUid(config, uid) {
+  let client;
+  let lock;
+
+  try {
+    client = createClient(config);
+
+    await runWithTimeout(
+      () => client.connect(),
+      12_000,
+      () => forceCloseClient(client)
+    );
+
+    lock = await runWithTimeout(
+      () => client.getMailboxLock(config.mailbox),
+      10_000,
+      () => forceCloseClient(client)
+    );
+
+    const message = await runWithTimeout(
+      () =>
+        client.fetchOne(
+          uid,
+          {
+            source: true,
+            envelope: true,
+            internalDate: true
+          },
+          {
+            uid: true
+          }
+        ),
+      20_000,
+      () => forceCloseClient(client)
+    );
+
+    if (!message?.source) {
+      throw new Error('Correo sin contenido');
+    }
+
+    const parsed = await runWithTimeout(
+      () => simpleParser(message.source),
+      15_000,
+      () => forceCloseClient(client)
+    );
+
+    const attachments = (parsed.attachments || []).map((attachment) => ({
+      filename: attachment.filename || null,
+      contentType:
+        attachment.contentType || 'application/octet-stream',
+      size:
+        attachment.size ||
+        attachment.content?.length ||
+        0,
+      content_base64: attachment.content
+        ? attachment.content.toString('base64')
+        : ''
+    }));
+
+    return {
+      uid: message.uid || uid,
+      internalDate: message.internalDate || null,
+      messageId: parsed.messageId || null,
+      from: parsed.from?.text || '',
+      to: parsed.to?.text || '',
+      subject: parsed.subject || '',
+      text: parsed.text || '',
+      html: parsed.html || '',
+      attachments
+    };
+  } finally {
+    if (lock) {
+      try {
+        lock.release();
+      } catch (_) {
+        // Ignorar errores de liberación.
+      }
+    }
+
+    await closeClient(client);
+  }
+}
+
 app.get('/api/health', (req, res) => {
   return res.json({
     status: 'ok',
@@ -155,9 +296,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-/**
- * Verifica la conexión de una cuenta IMAP.
- */
 app.post('/api/test', authToken, async (req, res) => {
   let client;
 
@@ -166,12 +304,21 @@ app.post('/api/test', authToken, async (req, res) => {
 
     client = createClient(config);
 
-    await client.connect();
+    await runWithTimeout(
+      () => client.connect(),
+      12_000,
+      () => forceCloseClient(client)
+    );
 
-    const status = await client.status(config.mailbox, {
-      messages: true,
-      unseen: true
-    });
+    const status = await runWithTimeout(
+      () =>
+        client.status(config.mailbox, {
+          messages: true,
+          unseen: true
+        }),
+      12_000,
+      () => forceCloseClient(client)
+    );
 
     await closeClient(client);
     client = null;
@@ -190,7 +337,7 @@ app.post('/api/test', authToken, async (req, res) => {
       responseCode: error.responseCode || null
     });
 
-    await closeClient(client);
+    forceCloseClient(client);
 
     return res.status(500).json({
       success: false,
@@ -202,9 +349,6 @@ app.post('/api/test', authToken, async (req, res) => {
 });
 
 app.post('/api/inbox', authToken, async (req, res) => {
-  let client;
-  let lock;
-
   try {
     const config = getImapConfig(req.body);
 
@@ -217,102 +361,27 @@ app.post('/api/inbox', authToken, async (req, res) => {
       ? Math.min(Math.max(requestedLimit, 1), 10)
       : 10;
 
-    client = createClient(config);
-    await client.connect();
-
-    lock = await client.getMailboxLock(config.mailbox);
-
-    const unseenUids = await client.search(
-      { seen: false },
-      { uid: true }
-    );
-
-    const selectedUids = unseenUids.slice(-limit).reverse();
+    const selectedUids = await searchUnreadUids(config, limit);
 
     const messages = [];
     const failed = [];
 
     for (const uid of selectedUids) {
       try {
-        const message = await Promise.race([
-          client.fetchOne(
-            uid,
-            {
-              source: true,
-              envelope: true,
-              internalDate: true
-            },
-            {
-              uid: true
-            }
-          ),
-          new Promise((_, reject) => {
-            setTimeout(() => {
-              reject(new Error('Timeout al descargar el correo'));
-            }, 15_000);
-          })
-        ]);
-
-        if (!message?.source) {
-          failed.push({
-            uid,
-            error: 'Correo sin contenido'
-          });
-
-          continue;
-        }
-
-        const parsed = await Promise.race([
-          simpleParser(message.source),
-          new Promise((_, reject) => {
-            setTimeout(() => {
-              reject(new Error('Timeout al procesar el correo'));
-            }, 15_000);
-          })
-        ]);
-
-        const attachments = (parsed.attachments || []).map((attachment) => ({
-          filename: attachment.filename || null,
-          contentType:
-            attachment.contentType || 'application/octet-stream',
-          size:
-            attachment.size ||
-            attachment.content?.length ||
-            0,
-          content_base64: attachment.content
-            ? attachment.content.toString('base64')
-            : ''
-        }));
-
-        messages.push({
-          uid: message.uid,
-          internalDate: message.internalDate,
-          messageId: parsed.messageId || null,
-          from: parsed.from?.text || '',
-          to: parsed.to?.text || '',
-          subject: parsed.subject || '',
-          text: parsed.text || '',
-          html: parsed.html || '',
-          attachments
-        });
-      } catch (messageError) {
+        const message = await fetchMessageByUid(config, uid);
+        messages.push(message);
+      } catch (error) {
         console.error('IMAP message failed:', {
           uid,
-          message: messageError.message
+          message: error.message
         });
 
         failed.push({
           uid,
-          error: messageError.message
+          error: error.message
         });
       }
     }
-
-    lock.release();
-    lock = null;
-
-    await closeClient(client);
-    client = null;
 
     return res.json({
       success: true,
@@ -328,16 +397,6 @@ app.post('/api/inbox', authToken, async (req, res) => {
       responseCode: error.responseCode || null
     });
 
-    if (lock) {
-      try {
-        lock.release();
-      } catch (_) {
-        // Ignorar error de liberación.
-      }
-    }
-
-    await closeClient(client);
-
     return res.status(500).json({
       success: false,
       error: error.message,
@@ -347,9 +406,6 @@ app.post('/api/inbox', authToken, async (req, res) => {
   }
 });
 
-/**
- * Marca un correo como leído.
- */
 app.post('/api/mark-read', authToken, async (req, res) => {
   let client;
   let lock;
@@ -357,7 +413,10 @@ app.post('/api/mark-read', authToken, async (req, res) => {
   try {
     const config = getImapConfig(req.body);
 
-    const uid = Number.parseInt(String(req.body.uid || ''), 10);
+    const uid = Number.parseInt(
+      String(req.body.uid || ''),
+      10
+    );
 
     if (!Number.isInteger(uid) || uid <= 0) {
       return res.status(400).json({
@@ -368,16 +427,29 @@ app.post('/api/mark-read', authToken, async (req, res) => {
 
     client = createClient(config);
 
-    await client.connect();
+    await runWithTimeout(
+      () => client.connect(),
+      12_000,
+      () => forceCloseClient(client)
+    );
 
-    lock = await client.getMailboxLock(config.mailbox);
+    lock = await runWithTimeout(
+      () => client.getMailboxLock(config.mailbox),
+      10_000,
+      () => forceCloseClient(client)
+    );
 
-    await client.messageFlagsAdd(
-      uid,
-      ['\\Seen'],
-      {
-        uid: true
-      }
+    await runWithTimeout(
+      () =>
+        client.messageFlagsAdd(
+          uid,
+          ['\\Seen'],
+          {
+            uid: true
+          }
+        ),
+      10_000,
+      () => forceCloseClient(client)
     );
 
     lock.release();
@@ -405,7 +477,7 @@ app.post('/api/mark-read', authToken, async (req, res) => {
       }
     }
 
-    await closeClient(client);
+    forceCloseClient(client);
 
     return res.status(500).json({
       success: false,
