@@ -10,6 +10,9 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
+const DEFAULT_BATCH_SIZE = 20;
+const MAX_BATCH_SIZE = 50;
+
 function safeTokenEquals(receivedToken, expectedToken) {
   if (!receivedToken || !expectedToken) {
     return false;
@@ -99,9 +102,9 @@ function createClient(config) {
       pass: config.pass
     },
     logger: false,
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 20_000
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 60_000
   });
 }
 
@@ -128,7 +131,7 @@ async function closeClient(client) {
       new Promise((_, reject) => {
         setTimeout(() => {
           reject(new Error('IMAP logout timeout'));
-        }, 2_000);
+        }, 3_000);
       })
     ]);
   } catch (_) {
@@ -150,7 +153,9 @@ async function runWithTimeout(operation, timeoutMs, onTimeout) {
             // Ignorar errores durante cancelación.
           }
 
-          reject(new Error(`Tiempo máximo excedido (${timeoutMs} ms)`));
+          reject(
+            new Error(`Tiempo máximo excedido (${timeoutMs} ms)`)
+          );
         }, timeoutMs);
       })
     ]);
@@ -161,12 +166,142 @@ async function runWithTimeout(operation, timeoutMs, onTimeout) {
   }
 }
 
-async function searchMessageUids(config, options = {}) {
+function parseIsoDate(value, fieldName) {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = String(value).trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw new Error(`${fieldName} debe usar formato YYYY-MM-DD`);
+  }
+
+  const date = new Date(`${normalized}T00:00:00.000Z`);
+
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${fieldName} inválido`);
+  }
+
+  return normalized;
+}
+
+function addUtcDays(dateString, days) {
+  const [year, month, day] = dateString
+    .split('-')
+    .map(Number);
+
+  const date = new Date(
+    Date.UTC(year, month - 1, day + days)
+  );
+
+  return date.toISOString().slice(0, 10);
+}
+
+function parseBatchSize(value) {
+  const parsed = Number.parseInt(
+    String(value || DEFAULT_BATCH_SIZE),
+    10
+  );
+
+  if (!Number.isInteger(parsed)) {
+    return DEFAULT_BATCH_SIZE;
+  }
+
+  return Math.min(
+    Math.max(parsed, 1),
+    MAX_BATCH_SIZE
+  );
+}
+
+function parseCursor(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(String(value), 10);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('cursor inválido');
+  }
+
+  return parsed;
+}
+
+function buildSearchCriteria({
+  includeRead,
+  dateFrom,
+  dateTo,
+  cursor
+}) {
+  const criteria = {};
+
+  if (!includeRead) {
+    criteria.seen = false;
+  }
+
+  if (dateFrom) {
+    criteria.since = dateFrom;
+  }
+
+  if (dateTo) {
+    criteria.before = addUtcDays(dateTo, 1);
+  }
+
+  if (cursor) {
+    criteria.uid = `1:${cursor - 1}`;
+  }
+
+  return criteria;
+}
+
+async function parseFetchedMessage(message) {
+  if (!message?.source) {
+    throw new Error('Correo sin contenido');
+  }
+
+  const parsed = await simpleParser(message.source);
+
+  const attachments = (parsed.attachments || []).map(
+    (attachment) => ({
+      filename: attachment.filename || null,
+      contentType:
+        attachment.contentType ||
+        'application/octet-stream',
+      size:
+        attachment.size ||
+        attachment.content?.length ||
+        0,
+      content_base64: attachment.content
+        ? attachment.content.toString('base64')
+        : ''
+    })
+  );
+
+  return {
+    uid: message.uid,
+    internalDate: message.internalDate || null,
+    messageId: parsed.messageId || null,
+    from: parsed.from?.text || '',
+    to: parsed.to?.text || '',
+    subject: parsed.subject || '',
+    text: parsed.text || '',
+    html: parsed.html || '',
+    attachments
+  };
+}
+
+async function fetchInboxBatch(config, options = {}) {
   const {
-    limit = 100,
     includeRead = false,
     dateFrom = null,
-    dateTo = null
+    dateTo = null,
+    batchSize = DEFAULT_BATCH_SIZE,
+    cursor = null
   } = options;
 
   let client;
@@ -177,83 +312,67 @@ async function searchMessageUids(config, options = {}) {
 
     await runWithTimeout(
       () => client.connect(),
-      12_000,
-      () => forceCloseClient(client)
-    );
-
-    lock = await runWithTimeout(
-      () => client.getMailboxLock(config.mailbox),
-      10_000,
-      () => forceCloseClient(client)
-    );
-
-    const searchCriteria = {};
-
-    if (!includeRead) {
-      searchCriteria.seen = false;
-    }
-
-    if (dateFrom) {
-      searchCriteria.since = dateFrom;
-    }
-
-    if (dateTo) {
-      const [year, month, day] = dateTo.split('-').map(Number);
-      const nextDay = new Date(Date.UTC(year, month - 1, day + 1));
-
-      searchCriteria.before = nextDay
-        .toISOString()
-        .slice(0, 10);
-    }
-
-    const uids = await runWithTimeout(
-      () => client.search(searchCriteria, { uid: true }),
       15_000,
       () => forceCloseClient(client)
     );
 
-    const messageUids = Array.isArray(uids) ? uids : [];
-
-    return messageUids
-      .slice(-limit)
-      .reverse();
-  } finally {
-    if (lock) {
-      try {
-        lock.release();
-      } catch (_) {
-        // Ignorar errores de liberación.
-      }
-    }
-
-    await closeClient(client);
-  }
-}
-
-async function fetchMessageByUid(config, uid) {
-  let client;
-  let lock;
-
-  try {
-    client = createClient(config);
-
-    await runWithTimeout(
-      () => client.connect(),
-      12_000,
-      () => forceCloseClient(client)
-    );
-
     lock = await runWithTimeout(
       () => client.getMailboxLock(config.mailbox),
-      10_000,
+      15_000,
       () => forceCloseClient(client)
     );
 
-    const message = await runWithTimeout(
+    const searchCriteria = buildSearchCriteria({
+      includeRead,
+      dateFrom,
+      dateTo,
+      cursor
+    });
+
+    const uids = await runWithTimeout(
       () =>
-        client.fetchOne(
-          uid,
+        client.search(
+          searchCriteria,
+          { uid: true }
+        ),
+      20_000,
+      () => forceCloseClient(client)
+    );
+
+    const matchingUids = Array.isArray(uids)
+      ? uids
+      : [];
+
+    if (matchingUids.length === 0) {
+      return {
+        messages: [],
+        failed: [],
+        hasMore: false,
+        nextCursor: null,
+        totalMatching: 0
+      };
+    }
+
+    matchingUids.sort((a, b) => b - a);
+
+    const selectedUids = matchingUids.slice(
+      0,
+      batchSize
+    );
+
+    const hasMore =
+      matchingUids.length > selectedUids.length;
+
+    const nextCursor = hasMore
+      ? selectedUids[selectedUids.length - 1]
+      : null;
+
+    const fetched = await runWithTimeout(
+      () =>
+        client.fetchAll(
+          selectedUids,
           {
+            uid: true,
             source: true,
             envelope: true,
             internalDate: true
@@ -262,43 +381,55 @@ async function fetchMessageByUid(config, uid) {
             uid: true
           }
         ),
-      20_000,
+      60_000,
       () => forceCloseClient(client)
     );
 
-    if (!message?.source) {
-      throw new Error('Correo sin contenido');
+    const fetchedByUid = new Map();
+
+    for (const message of fetched || []) {
+      fetchedByUid.set(message.uid, message);
     }
 
-    const parsed = await runWithTimeout(
-      () => simpleParser(message.source),
-      15_000,
-      () => forceCloseClient(client)
-    );
+    const messages = [];
+    const failed = [];
 
-    const attachments = (parsed.attachments || []).map((attachment) => ({
-      filename: attachment.filename || null,
-      contentType:
-        attachment.contentType || 'application/octet-stream',
-      size:
-        attachment.size ||
-        attachment.content?.length ||
-        0,
-      content_base64: attachment.content
-        ? attachment.content.toString('base64')
-        : ''
-    }));
+    for (const uid of selectedUids) {
+      const rawMessage = fetchedByUid.get(uid);
+
+      if (!rawMessage) {
+        failed.push({
+          uid,
+          error: 'Correo no devuelto por IMAP'
+        });
+
+        continue;
+      }
+
+      try {
+        const parsedMessage =
+          await parseFetchedMessage(rawMessage);
+
+        messages.push(parsedMessage);
+      } catch (error) {
+        console.error('IMAP parse failed:', {
+          uid,
+          message: error.message
+        });
+
+        failed.push({
+          uid,
+          error: error.message
+        });
+      }
+    }
 
     return {
-      uid: message.uid || uid,
-      internalDate: message.internalDate || null,
-      messageId: parsed.messageId || null,
-      from: parsed.from?.text || '',
-      to: parsed.to?.text || '',
-      subject: parsed.subject || '',
-      text: parsed.text || '',
-      html: parsed.html || '',
-      attachments
+      messages,
+      failed,
+      hasMore,
+      nextCursor,
+      totalMatching: matchingUids.length
     };
   } finally {
     if (lock) {
@@ -316,7 +447,7 @@ async function fetchMessageByUid(config, uid) {
 app.get('/api/health', (req, res) => {
   return res.json({
     status: 'ok',
-    mode: 'multi-account',
+    mode: 'multi-account-batched',
     token_configured: Boolean(SECRET_TOKEN),
     timestamp: new Date().toISOString()
   });
@@ -332,7 +463,7 @@ app.post('/api/test', authToken, async (req, res) => {
 
     await runWithTimeout(
       () => client.connect(),
-      12_000,
+      15_000,
       () => forceCloseClient(client)
     );
 
@@ -342,7 +473,7 @@ app.post('/api/test', authToken, async (req, res) => {
           messages: true,
           unseen: true
         }),
-      12_000,
+      15_000,
       () => forceCloseClient(client)
     );
 
@@ -374,64 +505,74 @@ app.post('/api/test', authToken, async (req, res) => {
   }
 });
 
-
-
 app.post('/api/inbox', authToken, async (req, res) => {
   try {
     const config = getImapConfig(req.body);
 
-    const requestedLimit = Number.parseInt(
-      String(req.body.limit || '100'),
-      10
+    const includeRead =
+      req.body.include_read === true;
+
+    const dateFrom = parseIsoDate(
+      req.body.date_from,
+      'date_from'
     );
 
-    const limit = Number.isInteger(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 200)
-      : 100;
+    const dateTo = parseIsoDate(
+      req.body.date_to,
+      'date_to'
+    );
 
-    const includeRead = req.body.include_read === true;
-
-    const dateFrom = req.body.date_from
-      ? String(req.body.date_from).trim()
-      : null;
-
-    const dateTo = req.body.date_to
-      ? String(req.body.date_to).trim()
-      : null;
-
-    const selectedUids = await searchMessageUids(config, {
-      limit,
-      includeRead,
-      dateFrom,
-      dateTo
-    });
-
-    const messages = [];
-    const failed = [];
-
-    for (const uid of selectedUids) {
-      try {
-        const message = await fetchMessageByUid(config, uid);
-        messages.push(message);
-      } catch (error) {
-        console.error('IMAP message failed:', {
-          uid,
-          message: error.message
-        });
-
-        failed.push({
-          uid,
-          error: error.message
-        });
-      }
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'date_from no puede ser mayor que date_to'
+      });
     }
+
+    const batchSize = parseBatchSize(
+      req.body.batch_size
+    );
+
+    const cursor = parseCursor(
+      req.body.cursor
+    );
+
+    const result = await fetchInboxBatch(
+      config,
+      {
+        includeRead,
+        dateFrom,
+        dateTo,
+        batchSize,
+        cursor
+      }
+    );
 
     return res.json({
       success: true,
-      count: messages.length,
-      failed_count: failed.length,
-      failed,
-      messages
+
+      count: result.messages.length,
+
+      failed_count: result.failed.length,
+
+      failed: result.failed,
+
+      messages: result.messages,
+
+      pagination: {
+        batch_size: batchSize,
+        has_more: result.hasMore,
+        next_cursor: result.nextCursor
+      },
+
+      search: {
+        include_read: includeRead,
+        date_from: dateFrom,
+        date_to: dateTo,
+        matching_remaining_in_search:
+          result.totalMatching
+      }
     });
   } catch (error) {
     console.error('IMAP inbox failed:', {
@@ -472,13 +613,16 @@ app.post('/api/mark-read', authToken, async (req, res) => {
 
     await runWithTimeout(
       () => client.connect(),
-      12_000,
+      15_000,
       () => forceCloseClient(client)
     );
 
     lock = await runWithTimeout(
-      () => client.getMailboxLock(config.mailbox),
-      10_000,
+      () =>
+        client.getMailboxLock(
+          config.mailbox
+        ),
+      15_000,
       () => forceCloseClient(client)
     );
 
@@ -491,7 +635,7 @@ app.post('/api/mark-read', authToken, async (req, res) => {
             uid: true
           }
         ),
-      10_000,
+      15_000,
       () => forceCloseClient(client)
     );
 
@@ -537,6 +681,10 @@ app.listen(PORT, '0.0.0.0', () => {
   );
 
   console.log(
-    `Token: ${SECRET_TOKEN ? 'configurado' : 'NO configurado'}`
+    `Token: ${
+      SECRET_TOKEN
+        ? 'configurado'
+        : 'NO configurado'
+    }`
   );
 });
