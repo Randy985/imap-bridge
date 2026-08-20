@@ -371,6 +371,8 @@ app.post('/api/test', authToken, async (req, res) => {
   }
 });
 
+
+
 app.post('/api/inbox', authToken, async (req, res) => {
   try {
     const config = getImapConfig(req.body);
