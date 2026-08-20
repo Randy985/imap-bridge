@@ -194,13 +194,16 @@ async function searchMessageUids(config, options = {}) {
     }
 
     if (dateFrom) {
-      searchCriteria.since = new Date(`${dateFrom}T00:00:00.000Z`);
+      searchCriteria.since = dateFrom;
     }
 
     if (dateTo) {
-      const beforeDate = new Date(`${dateTo}T00:00:00.000Z`);
-      beforeDate.setUTCDate(beforeDate.getUTCDate() + 1);
-      searchCriteria.before = beforeDate;
+      const [year, month, day] = dateTo.split('-').map(Number);
+      const nextDay = new Date(Date.UTC(year, month - 1, day + 1));
+
+      searchCriteria.before = nextDay
+        .toISOString()
+        .slice(0, 10);
     }
 
     const uids = await runWithTimeout(
