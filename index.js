@@ -161,7 +161,14 @@ async function runWithTimeout(operation, timeoutMs, onTimeout) {
   }
 }
 
-async function searchUnreadUids(config, limit) {
+async function searchMessageUids(config, options = {}) {
+  const {
+    limit = 100,
+    includeRead = false,
+    dateFrom = null,
+    dateTo = null
+  } = options;
+
   let client;
   let lock;
 
@@ -180,15 +187,31 @@ async function searchUnreadUids(config, limit) {
       () => forceCloseClient(client)
     );
 
+    const searchCriteria = {};
+
+    if (!includeRead) {
+      searchCriteria.seen = false;
+    }
+
+    if (dateFrom) {
+      searchCriteria.since = new Date(`${dateFrom}T00:00:00.000Z`);
+    }
+
+    if (dateTo) {
+      const beforeDate = new Date(`${dateTo}T00:00:00.000Z`);
+      beforeDate.setUTCDate(beforeDate.getUTCDate() + 1);
+      searchCriteria.before = beforeDate;
+    }
+
     const uids = await runWithTimeout(
-      () => client.search({ seen: false }, { uid: true }),
+      () => client.search(searchCriteria, { uid: true }),
       15_000,
       () => forceCloseClient(client)
     );
 
-    const unreadUids = Array.isArray(uids) ? uids : [];
+    const messageUids = Array.isArray(uids) ? uids : [];
 
-    return unreadUids
+    return messageUids
       .slice(-limit)
       .reverse();
   } finally {
@@ -353,15 +376,30 @@ app.post('/api/inbox', authToken, async (req, res) => {
     const config = getImapConfig(req.body);
 
     const requestedLimit = Number.parseInt(
-      String(req.body.limit || '10'),
+      String(req.body.limit || '100'),
       10
     );
 
     const limit = Number.isInteger(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 10)
-      : 10;
+      ? Math.min(Math.max(requestedLimit, 1), 200)
+      : 100;
 
-    const selectedUids = await searchUnreadUids(config, limit);
+    const includeRead = req.body.include_read === true;
+
+    const dateFrom = req.body.date_from
+      ? String(req.body.date_from).trim()
+      : null;
+
+    const dateTo = req.body.date_to
+      ? String(req.body.date_to).trim()
+      : null;
+
+    const selectedUids = await searchMessageUids(config, {
+      limit,
+      includeRead,
+      dateFrom,
+      dateTo
+    });
 
     const messages = [];
     const failed = [];
