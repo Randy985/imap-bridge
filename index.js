@@ -590,90 +590,90 @@ app.post('/api/inbox', authToken, async (req, res) => {
   }
 });
 
-app.post('/api/mark-read', authToken, async (req, res) => {
-  let client;
-  let lock;
+// app.post('/api/mark-read', authToken, async (req, res) => {
+//   let client;
+//   let lock;
 
-  try {
-    const config = getImapConfig(req.body);
+//   try {
+//     const config = getImapConfig(req.body);
 
-    const uid = Number.parseInt(
-      String(req.body.uid || ''),
-      10
-    );
+//     const uid = Number.parseInt(
+//       String(req.body.uid || ''),
+//       10
+//     );
 
-    if (!Number.isInteger(uid) || uid <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'uid requerido'
-      });
-    }
+//     if (!Number.isInteger(uid) || uid <= 0) {
+//       return res.status(400).json({
+//         success: false,
+//         error: 'uid requerido'
+//       });
+//     }
 
-    client = createClient(config);
+//     client = createClient(config);
 
-    await runWithTimeout(
-      () => client.connect(),
-      15_000,
-      () => forceCloseClient(client)
-    );
+//     await runWithTimeout(
+//       () => client.connect(),
+//       15_000,
+//       () => forceCloseClient(client)
+//     );
 
-    lock = await runWithTimeout(
-      () =>
-        client.getMailboxLock(
-          config.mailbox
-        ),
-      15_000,
-      () => forceCloseClient(client)
-    );
+//     lock = await runWithTimeout(
+//       () =>
+//         client.getMailboxLock(
+//           config.mailbox
+//         ),
+//       15_000,
+//       () => forceCloseClient(client)
+//     );
 
-    await runWithTimeout(
-      () =>
-        client.messageFlagsAdd(
-          uid,
-          ['\\Seen'],
-          {
-            uid: true
-          }
-        ),
-      15_000,
-      () => forceCloseClient(client)
-    );
+//     await runWithTimeout(
+//       () =>
+//         client.messageFlagsAdd(
+//           uid,
+//           ['\\Seen'],
+//           {
+//             uid: true
+//           }
+//         ),
+//       15_000,
+//       () => forceCloseClient(client)
+//     );
 
-    lock.release();
-    lock = null;
+//     lock.release();
+//     lock = null;
 
-    await closeClient(client);
-    client = null;
+//     await closeClient(client);
+//     client = null;
 
-    return res.json({
-      success: true,
-      message: `UID ${uid} marcado como leido`
-    });
-  } catch (error) {
-    console.error('IMAP mark-read failed:', {
-      message: error.message,
-      code: error.code || null,
-      responseCode: error.responseCode || null
-    });
+//     return res.json({
+//       success: true,
+//       message: `UID ${uid} marcado como leido`
+//     });
+//   } catch (error) {
+//     console.error('IMAP mark-read failed:', {
+//       message: error.message,
+//       code: error.code || null,
+//       responseCode: error.responseCode || null
+//     });
 
-    if (lock) {
-      try {
-        lock.release();
-      } catch (_) {
-        // Ignorar errores de liberación.
-      }
-    }
+//     if (lock) {
+//       try {
+//         lock.release();
+//       } catch (_) {
+//         // Ignorar errores de liberación.
+//       }
+//     }
 
-    forceCloseClient(client);
+//     forceCloseClient(client);
 
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-      code: error.code || null,
-      responseCode: error.responseCode || null
-    });
-  }
-});
+//     return res.status(500).json({
+//       success: false,
+//       error: error.message,
+//       code: error.code || null,
+//       responseCode: error.responseCode || null
+//     });
+//   }
+// });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(
