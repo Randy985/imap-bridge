@@ -10,6 +10,7 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
+// Estos límites controlan cada descarga IMAP, no el total de la respuesta.
 const DEFAULT_BATCH_SIZE = 20;
 const MAX_BATCH_SIZE = 50;
 
@@ -233,16 +234,11 @@ function parseCursor(value) {
 }
 
 function buildSearchCriteria({
-  includeRead,
   dateFrom,
   dateTo,
   cursor
 }) {
-  const criteria = {};
-
-  if (!includeRead) {
-    criteria.seen = false;
-  }
+  const criteria = { seen: false };
 
   if (dateFrom) {
     criteria.since = dateFrom;
@@ -297,7 +293,6 @@ async function parseFetchedMessage(message) {
 
 async function fetchInboxBatch(config, options = {}) {
   const {
-    includeRead = false,
     dateFrom = null,
     dateTo = null,
     batchSize = DEFAULT_BATCH_SIZE,
@@ -323,13 +318,13 @@ async function fetchInboxBatch(config, options = {}) {
     );
 
     const searchCriteria = buildSearchCriteria({
-      includeRead,
       dateFrom,
       dateTo,
       cursor
     });
 
-    const uids = await runWithTimeout(
+    // No existen UID inferiores a 1; evitar el rango IMAP inválido 1:0.
+    const uids = cursor === 1 ? [] : await runWithTimeout(
       () =>
         client.search(
           searchCriteria,
@@ -355,80 +350,73 @@ async function fetchInboxBatch(config, options = {}) {
 
     matchingUids.sort((a, b) => b - a);
 
-    const selectedUids = matchingUids.slice(
-      0,
-      batchSize
-    );
-
-    const hasMore =
-      matchingUids.length > selectedUids.length;
-
-    const nextCursor = hasMore
-      ? selectedUids[selectedUids.length - 1]
-      : null;
-
-    const fetched = await runWithTimeout(
-      () =>
-        client.fetchAll(
-          selectedUids,
-          {
-            uid: true,
-            source: true,
-            envelope: true,
-            internalDate: true
-          },
-          {
-            uid: true
-          }
-        ),
-      60_000,
-      () => forceCloseClient(client)
-    );
-
-    const fetchedByUid = new Map();
-
-    for (const message of fetched || []) {
-      fetchedByUid.set(message.uid, message);
-    }
-
     const messages = [];
     const failed = [];
 
-    for (const uid of selectedUids) {
-      const rawMessage = fetchedByUid.get(uid);
+    // Agotar la búsqueda en esta llamada; Base44 no recorre páginas.
+    for (let offset = 0; offset < matchingUids.length; offset += batchSize) {
+      const selectedUids = matchingUids.slice(offset, offset + batchSize);
 
-      if (!rawMessage) {
-        failed.push({
-          uid,
-          error: 'Correo no devuelto por IMAP'
-        });
+      const fetched = await runWithTimeout(
+        () =>
+          client.fetchAll(
+            selectedUids,
+            {
+              uid: true,
+              source: true,
+              envelope: true,
+              internalDate: true
+            },
+            {
+              uid: true
+            }
+          ),
+        60_000,
+        () => forceCloseClient(client)
+      );
 
-        continue;
+      const fetchedByUid = new Map();
+
+      for (const message of fetched || []) {
+        fetchedByUid.set(message.uid, message);
       }
 
-      try {
-        const parsedMessage =
-          await parseFetchedMessage(rawMessage);
+      for (const uid of selectedUids) {
+        const rawMessage = fetchedByUid.get(uid);
 
-        messages.push(parsedMessage);
-      } catch (error) {
-        console.error('IMAP parse failed:', {
-          uid,
-          message: error.message
-        });
+        if (!rawMessage) {
+          failed.push({
+            uid,
+            error: 'Correo no devuelto por IMAP'
+          });
 
-        failed.push({
-          uid,
-          error: error.message
-        });
+          continue;
+        }
+
+        try {
+          const parsedMessage =
+            await parseFetchedMessage(rawMessage);
+
+          messages.push(parsedMessage);
+        } catch (error) {
+          console.error('IMAP parse failed:', {
+            uid,
+            message: error.message
+          });
+
+          failed.push({
+            uid,
+            error: error.message
+          });
+        }
       }
     }
 
     return {
       messages,
       failed,
-      hasMore,
-      nextCursor,
+      hasMore: false,
+      nextCursor: null,
       totalMatching: matchingUids.length
     };
   } finally {
@@ -509,9 +497,6 @@ app.post('/api/inbox', authToken, async (req, res) => {
   try {
     const config = getImapConfig(req.body);
 
-    const includeRead =
-      req.body.include_read === true;
-
     const dateFrom = parseIsoDate(
       req.body.date_from,
       'date_from'
@@ -531,7 +516,9 @@ app.post('/api/inbox', authToken, async (req, res) => {
     }
 
     const batchSize = parseBatchSize(
-      req.body.batch_size
+      req.body.batch_size !== undefined
+        ? req.body.batch_size
+        : req.body.limit
     );
 
     const cursor = parseCursor(
@@ -541,7 +528,6 @@ app.post('/api/inbox', authToken, async (req, res) => {
     const result = await fetchInboxBatch(
       config,
       {
-        includeRead,
         dateFrom,
         dateTo,
         batchSize,
@@ -567,7 +553,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
       },
 
       search: {
-        include_read: includeRead,
+        include_read: false,
         date_from: dateFrom,
         date_to: dateTo,
         matching_remaining_in_search:
