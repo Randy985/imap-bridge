@@ -236,9 +236,10 @@ function parseCursor(value) {
 function buildSearchCriteria({
   dateFrom,
   dateTo,
-  cursor
+  cursor,
+  includeRead = false
 }) {
-  const criteria = { seen: false };
+  const criteria = includeRead ? {} : { seen: false };
 
   if (dateFrom) {
     criteria.since = dateFrom;
@@ -296,7 +297,8 @@ async function fetchInboxBatch(config, options = {}) {
     dateFrom = null,
     dateTo = null,
     batchSize = DEFAULT_BATCH_SIZE,
-    cursor = null
+    cursor = null,
+    includeRead = false
   } = options;
 
   let client;
@@ -320,7 +322,8 @@ async function fetchInboxBatch(config, options = {}) {
     const searchCriteria = buildSearchCriteria({
       dateFrom,
       dateTo,
-      cursor
+      cursor,
+      includeRead
     });
 
     // No existen UID inferiores a 1; evitar el rango IMAP inválido 1:0.
@@ -524,6 +527,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
     const cursor = parseCursor(
       req.body.cursor
     );
+    const includeRead = req.body.include_read === true;
 
     const result = await fetchInboxBatch(
       config,
@@ -531,7 +535,8 @@ app.post('/api/inbox', authToken, async (req, res) => {
         dateFrom,
         dateTo,
         batchSize,
-        cursor
+        cursor,
+        includeRead
       }
     );
 
@@ -553,7 +558,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
       },
 
       search: {
-        include_read: false,
+        include_read: includeRead,
         date_from: dateFrom,
         date_to: dateTo,
         matching_remaining_in_search:
