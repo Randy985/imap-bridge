@@ -121,7 +121,7 @@ function forceCloseClient(client) {
   }
 }
 
-async function closeClient(client) {
+async function closeClient(client, diagnostics = null) {
   if (!client) {
     return;
   }
@@ -135,7 +135,8 @@ async function closeClient(client) {
         }, 3_000);
       })
     ]);
-  } catch (_) {
+  } catch (error) {
+    diagnostics?.error('cleanup_error', error, { stage: 'imap_logout' });
     forceCloseClient(client);
   }
 }
@@ -267,37 +268,110 @@ async function parseFetchedMessage(message) {
   };
 }
 
+function createInboxDiagnostics() {
+  const requestId = crypto.randomUUID();
+  const startedAt = process.hrtime.bigint();
+  const diagnostics = {
+    stage: 'request',
+    failureStage: null,
+    log(event, details = {}, isError = false) {
+      const memory = process.memoryUsage();
+      const entry = {
+        event,
+        request_id: requestId,
+        timestamp: new Date().toISOString(),
+        stage: diagnostics.stage,
+        elapsed_ms: Number(process.hrtime.bigint() - startedAt) / 1e6,
+        memory_bytes: {
+          rss: memory.rss,
+          heap_used: memory.heapUsed,
+          heap_total: memory.heapTotal,
+          external: memory.external,
+          array_buffers: memory.arrayBuffers
+        },
+        ...details
+      };
+
+      // Registrar solo campos explícitos; nunca objetos de solicitud o de error.
+      (isError ? console.error : console.log)(JSON.stringify(entry));
+    },
+    error(event, error, details = {}) {
+      const message = String(error?.message || '');
+      const timeout = /timeout|timed out|Tiempo máximo excedido/i.test(message) ||
+        ['ETIMEDOUT', 'ETIMEOUT', 'CONNECT_TIMEOUT', 'GREETING_TIMEOUT',
+          'SOCKET_TIMEOUT'].includes(error?.code);
+
+      diagnostics.log(event, {
+        ...details,
+        timeout,
+        error_code: ['ETIMEDOUT', 'ETIMEOUT', 'CONNECT_TIMEOUT',
+          'GREETING_TIMEOUT', 'SOCKET_TIMEOUT', 'ECONNRESET', 'ECONNREFUSED',
+          'ENOTFOUND', 'EAI_AGAIN', 'EAUTH', 'AUTHENTICATIONFAILED',
+          'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT']
+          .includes(error?.code) ? error.code : null,
+        error_type: ['Error', 'TypeError', 'RangeError', 'SyntaxError']
+          .includes(error?.name) ? error.name : 'Error'
+      }, true);
+    },
+    async run(stage, operation, details = {}) {
+      diagnostics.stage = stage;
+      const operationStartedAt = process.hrtime.bigint();
+      diagnostics.log('stage_start', details);
+
+      try {
+        const result = await operation();
+        diagnostics.log('stage_complete', {
+          ...details,
+          duration_ms: Number(process.hrtime.bigint() - operationStartedAt) / 1e6
+        });
+        return result;
+      } catch (error) {
+        diagnostics.failureStage ||= stage;
+        diagnostics.error('stage_error', error, {
+          ...details,
+          duration_ms: Number(process.hrtime.bigint() - operationStartedAt) / 1e6
+        });
+        throw error;
+      }
+    }
+  };
+
+  return diagnostics;
+}
+
 async function fetchInboxBatch(config, options = {}) {
   const {
     dateFrom = null,
     dateTo = null,
     batchSize = DEFAULT_BATCH_SIZE,
     cursor = null,
-    includeRead = false
+    includeRead = false,
+    diagnostics = createInboxDiagnostics()
   } = options;
 
   let client;
   let lock;
 
   try {
+    diagnostics.stage = 'client_create';
     client = createClient(config);
 
-    await runWithTimeout(
+    await diagnostics.run('imap_connect', () => runWithTimeout(
       () => client.connect(),
       15_000,
       () => forceCloseClient(client)
-    );
+    ), { timeout_ms: 15_000 });
 
-    lock = await runWithTimeout(
+    lock = await diagnostics.run('mailbox_open', () => runWithTimeout(
       () => client.getMailboxLock(config.mailbox),
       15_000,
       () => forceCloseClient(client)
-    );
+    ), { timeout_ms: 15_000 });
 
     const searchCriteria = buildSearchCriteria({ cursor });
 
     // No existen UID inferiores a 1; evitar el rango IMAP inválido 1:0.
-    const uids = cursor === 1 ? [] : await runWithTimeout(
+    const uids = cursor === 1 ? [] : await diagnostics.run('uid_search', () => runWithTimeout(
       () =>
         client.search(
           searchCriteria,
@@ -305,13 +379,19 @@ async function fetchInboxBatch(config, options = {}) {
         ),
       20_000,
       () => forceCloseClient(client)
-    );
+    ), { timeout_ms: 20_000 });
 
     const candidateUids = Array.isArray(uids)
       ? uids.filter((uid) => !cursor || uid < cursor)
       : [];
 
+    diagnostics.log('uid_search_result', {
+      uids_found: Array.isArray(uids) ? uids.length : 0,
+      candidate_uids: candidateUids.length
+    });
+
     if (candidateUids.length === 0) {
+      diagnostics.log('selection_complete', { matching_count: 0, selected_count: 0 });
       return {
         messages: [],
         failed: [],
@@ -339,7 +419,16 @@ async function fetchInboxBatch(config, options = {}) {
     // Contar coincidencias con metadatos; solo reservar contenido para una página.
     for (let offset = 0; offset < candidateUids.length; offset += batchSize) {
       const batchUids = candidateUids.slice(offset, offset + batchSize);
-      const metadata = await runWithTimeout(
+      const batchNumber = Math.floor(offset / batchSize) + 1;
+      const batchStartedAt = process.hrtime.bigint();
+      const selectedBefore = selectedUids.length;
+      diagnostics.stage = 'metadata_batch';
+      diagnostics.log('batch_start', {
+        batch_number: batchNumber,
+        batch_type: 'metadata',
+        uid_count: batchUids.length
+      });
+      const metadata = await diagnostics.run('metadata_fetch', () => runWithTimeout(
         () =>
           client.fetchAll(
             batchUids,
@@ -348,7 +437,8 @@ async function fetchInboxBatch(config, options = {}) {
           ),
         60_000,
         () => forceCloseClient(client)
-      );
+      ), { batch_number: batchNumber, timeout_ms: 60_000 });
+      diagnostics.stage = 'metadata_filter';
       const metadataByUid = new Map(
         (metadata || []).map((message) => [message.uid, message])
       );
@@ -363,6 +453,7 @@ async function fetchInboxBatch(config, options = {}) {
 
         if (!message) {
           if (pageOpen) {
+            diagnostics.log('message_error', { uid, reason: 'metadata_missing' }, true);
             failed.push({ uid, error: 'Correo no devuelto por IMAP' });
           }
           continue;
@@ -379,6 +470,7 @@ async function fetchInboxBatch(config, options = {}) {
 
           if (Number.isNaN(internalTime)) {
             if (pageOpen) {
+              diagnostics.log('message_error', { uid, reason: 'invalid_internal_date' }, true);
               failed.push({ uid, error: 'Correo sin internalDate válido' });
             }
             continue;
@@ -401,10 +493,26 @@ async function fetchInboxBatch(config, options = {}) {
 
       metadataByUid.clear();
       metadata.length = 0;
+      diagnostics.log('batch_complete', {
+        batch_number: batchNumber,
+        batch_type: 'metadata',
+        selected_count: selectedUids.length - selectedBefore,
+        duration_ms: Number(process.hrtime.bigint() - batchStartedAt) / 1e6
+      });
     }
 
+    diagnostics.log('selection_complete', {
+      matching_count: totalMatching,
+      selected_count: selectedUids.length
+    });
+
     if (selectedUids.length > 0) {
-      const fetched = await runWithTimeout(
+      const batchStartedAt = process.hrtime.bigint();
+      diagnostics.stage = 'content_batch';
+      diagnostics.log('batch_start', {
+        batch_number: 1, batch_type: 'content', uid_count: selectedUids.length
+      });
+      const fetched = await diagnostics.run('content_fetch', () => runWithTimeout(
         () =>
           client.fetchAll(
             selectedUids,
@@ -420,7 +528,7 @@ async function fetchInboxBatch(config, options = {}) {
           ),
         60_000,
         () => forceCloseClient(client)
-      );
+      ), { batch_number: 1, timeout_ms: 60_000 });
 
       const fetchedByUid = new Map();
 
@@ -431,10 +539,12 @@ async function fetchInboxBatch(config, options = {}) {
       fetched.length = 0;
 
       for (const uid of selectedUids) {
+        diagnostics.stage = 'content_processing';
         const rawMessage = fetchedByUid.get(uid);
         fetchedByUid.delete(uid);
 
         if (!rawMessage) {
+          diagnostics.log('message_error', { uid, reason: 'content_missing' }, true);
           failed.push({
             uid,
             error: 'Correo no devuelto por IMAP'
@@ -445,14 +555,13 @@ async function fetchInboxBatch(config, options = {}) {
 
         try {
           const parsedMessage =
-            await parseFetchedMessage(rawMessage);
+            await diagnostics.run('message_parse',
+              () => parseFetchedMessage(rawMessage), { uid });
 
           messages.push(parsedMessage);
         } catch (error) {
-          console.error('IMAP parse failed:', {
-            uid,
-            message: error.message
-          });
+          // El error ya fue registrado sin contenido por diagnostics.run().
+          diagnostics.failureStage = null;
 
           failed.push({
             uid,
@@ -465,6 +574,13 @@ async function fetchInboxBatch(config, options = {}) {
       }
 
       fetchedByUid.clear();
+      diagnostics.log('batch_complete', {
+        batch_number: 1,
+        batch_type: 'content',
+        returned_count: messages.length,
+        failed_count: failed.length,
+        duration_ms: Number(process.hrtime.bigint() - batchStartedAt) / 1e6
+      });
     }
 
     const hasMore = candidateUids[candidateUids.length - 1] < lastExaminedUid;
@@ -476,16 +592,21 @@ async function fetchInboxBatch(config, options = {}) {
       nextCursor: hasMore ? lastExaminedUid : null,
       totalMatching
     };
+  } catch (error) {
+    diagnostics.failureStage ||= diagnostics.stage;
+    diagnostics.error('inbox_fetch_error', error);
+    throw error;
   } finally {
     if (lock) {
       try {
         lock.release();
-      } catch (_) {
+      } catch (error) {
+        diagnostics.error('cleanup_error', error, { stage: 'lock_release' });
         // Ignorar errores de liberación.
       }
     }
 
-    await closeClient(client);
+    await diagnostics.run('imap_close', () => closeClient(client, diagnostics));
   }
 }
 
@@ -551,8 +672,35 @@ app.post('/api/test', authToken, async (req, res) => {
 });
 
 app.post('/api/inbox', authToken, async (req, res) => {
+  const diagnostics = createInboxDiagnostics();
+  let returnedCount = 0;
+  let failedCount = 0;
+  diagnostics.log('request_start');
+  res.once('finish', () => diagnostics.log('request_complete', {
+    stage: diagnostics.failureStage || diagnostics.stage,
+    status_code: res.statusCode,
+    returned_count: returnedCount,
+    failed_count: failedCount
+  }));
+  res.once('close', () => {
+    if (!res.writableFinished) {
+      diagnostics.log('response_closed', {
+        stage: diagnostics.failureStage || diagnostics.stage,
+        returned_count: returnedCount,
+        failed_count: failedCount
+      }, true);
+    }
+  });
+
   try {
+    diagnostics.stage = 'config_validation';
     const config = getImapConfig(req.body);
+
+    const maskedUser = config.user.split('@')
+      .map((part) => `${part.length > 1 ? part.slice(0, 1) : ''}***`)
+      .join('@');
+    diagnostics.log('imap_identity', { imap_user: maskedUser });
+    diagnostics.stage = 'date_validation';
 
     const dateFrom = parseIsoDate(
       req.body.date_from,
@@ -565,6 +713,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
     );
 
     if (dateFrom && dateTo && dateFrom > dateTo) {
+      diagnostics.log('validation_error', { reason: 'reversed_date_range' }, true);
       return res.status(400).json({
         success: false,
         error:
@@ -572,6 +721,7 @@ app.post('/api/inbox', authToken, async (req, res) => {
       });
     }
 
+    diagnostics.stage = 'pagination_validation';
     const batchSize = parseBatchSize(
       req.body.batch_size !== undefined
         ? req.body.batch_size
@@ -583,6 +733,14 @@ app.post('/api/inbox', authToken, async (req, res) => {
     );
     const includeRead = req.body.include_read === true;
 
+    diagnostics.log('request_options', {
+      date_from: dateFrom,
+      date_to: dateTo,
+      include_read: includeRead,
+      batch_size: batchSize,
+      cursor
+    });
+
     const result = await fetchInboxBatch(
       config,
       {
@@ -590,9 +748,20 @@ app.post('/api/inbox', authToken, async (req, res) => {
         dateTo,
         batchSize,
         cursor,
-        includeRead
+        includeRead,
+        diagnostics
       }
     );
+
+    returnedCount = result.messages.length;
+    failedCount = result.failed.length;
+    diagnostics.stage = 'response_json';
+    diagnostics.log('response_start', {
+      returned_count: returnedCount,
+      failed_count: failedCount,
+      has_more: result.hasMore,
+      next_cursor: result.nextCursor
+    });
 
     return res.json({
       success: true,
@@ -620,10 +789,8 @@ app.post('/api/inbox', authToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('IMAP inbox failed:', {
-      message: error.message,
-      code: error.code || null,
-      responseCode: error.responseCode || null
+    diagnostics.error('request_error', error, {
+      stage: diagnostics.failureStage || diagnostics.stage
     });
 
     return res.status(500).json({
