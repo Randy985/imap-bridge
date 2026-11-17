@@ -341,6 +341,16 @@ async function fetchInboxBatch(config, options = {}) {
       ? uids
       : [];
 
+    console.log('IMAP INBOX DIAGNOSTIC', {
+      mailbox: config.mailbox,
+      dateFrom,
+      dateTo,
+      includeRead,
+      totalMatching: matchingUids.length,
+      batchSize,
+      cursor
+    });
+
     if (matchingUids.length === 0) {
       return {
         messages: [],
