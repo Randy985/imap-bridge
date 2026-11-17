@@ -187,18 +187,6 @@ function parseIsoDate(value, fieldName) {
   return normalized;
 }
 
-function addUtcDays(dateString, days) {
-  const [year, month, day] = dateString
-    .split('-')
-    .map(Number);
-
-  const date = new Date(
-    Date.UTC(year, month - 1, day + days)
-  );
-
-  return date.toISOString().slice(0, 10);
-}
-
 function parseBatchSize(value) {
   const parsed = Number.parseInt(
     String(value || DEFAULT_BATCH_SIZE),
@@ -233,23 +221,10 @@ function parseCursor(value) {
   return parsed;
 }
 
-function buildSearchCriteria({
-  dateFrom,
-  dateTo,
-  cursor,
-  includeRead = false
-}) {
-  const criteria = includeRead ? {} : { seen: false };
+function buildSearchCriteria({ cursor }) {
+  const criteria = { all: true };
 
-  if (dateFrom) {
-    criteria.since = dateFrom;
-  }
-
-  if (dateTo) {
-    criteria.before = addUtcDays(dateTo, 1);
-  }
-
-  if (cursor) {
+  if (cursor > 1) {
     criteria.uid = `1:${cursor - 1}`;
   }
 
@@ -319,19 +294,7 @@ async function fetchInboxBatch(config, options = {}) {
       () => forceCloseClient(client)
     );
 
-    const searchCriteria = buildSearchCriteria({
-  dateFrom,
-  dateTo,
-  cursor,
-  includeRead
-});
-
-const allUids = await client.search(
-  { all: true },
-  { uid: true }
-);
-
-console.log('IMAP SIN FILTROS:', allUids.length);
+    const searchCriteria = buildSearchCriteria({ cursor });
 
     // No existen UID inferiores a 1; evitar el rango IMAP inválido 1:0.
     const uids = cursor === 1 ? [] : await runWithTimeout(
@@ -344,21 +307,11 @@ console.log('IMAP SIN FILTROS:', allUids.length);
       () => forceCloseClient(client)
     );
 
-    const matchingUids = Array.isArray(uids)
-      ? uids
+    const candidateUids = Array.isArray(uids)
+      ? uids.filter((uid) => !cursor || uid < cursor)
       : [];
 
-    console.log('IMAP INBOX DIAGNOSTIC', {
-      mailbox: config.mailbox,
-      dateFrom,
-      dateTo,
-      includeRead,
-      totalMatching: matchingUids.length,
-      batchSize,
-      cursor
-    });
-
-    if (matchingUids.length === 0) {
+    if (candidateUids.length === 0) {
       return {
         messages: [],
         failed: [],
@@ -368,14 +321,75 @@ console.log('IMAP SIN FILTROS:', allUids.length);
       };
     }
 
-    matchingUids.sort((a, b) => b - a);
+    candidateUids.sort((a, b) => b - a);
 
     const messages = [];
     const failed = [];
 
+    const fromTime = dateFrom
+      ? Date.parse(`${dateFrom}T00:00:00.000Z`)
+      : null;
+    const toTime = dateTo
+      ? Date.parse(`${dateTo}T23:59:59.999Z`)
+      : null;
+    let totalMatching = 0;
+
     // Agotar la búsqueda en esta llamada; Base44 no recorre páginas.
-    for (let offset = 0; offset < matchingUids.length; offset += batchSize) {
-      const selectedUids = matchingUids.slice(offset, offset + batchSize);
+    for (let offset = 0; offset < candidateUids.length; offset += batchSize) {
+      const batchUids = candidateUids.slice(offset, offset + batchSize);
+      const metadata = await runWithTimeout(
+        () =>
+          client.fetchAll(
+            batchUids,
+            { uid: true, internalDate: true, flags: true },
+            { uid: true }
+          ),
+        60_000,
+        () => forceCloseClient(client)
+      );
+      const metadataByUid = new Map(
+        (metadata || []).map((message) => [message.uid, message])
+      );
+      const selectedUids = [];
+
+      for (const uid of batchUids) {
+        const message = metadataByUid.get(uid);
+
+        if (!message) {
+          failed.push({ uid, error: 'Correo no devuelto por IMAP' });
+          continue;
+        }
+
+        if (!includeRead && message.flags.has('\\Seen')) {
+          continue;
+        }
+
+        if (fromTime !== null || toTime !== null) {
+          const internalTime = message.internalDate
+            ? new Date(message.internalDate).getTime()
+            : NaN;
+
+          if (Number.isNaN(internalTime)) {
+            failed.push({ uid, error: 'Correo sin internalDate válido' });
+            continue;
+          }
+
+          if (
+            (fromTime !== null && internalTime < fromTime) ||
+            (toTime !== null && internalTime > toTime)
+          ) {
+            continue;
+          }
+        }
+
+        selectedUids.push(uid);
+      }
+
+      totalMatching += selectedUids.length;
+
+      if (selectedUids.length === 0) {
+        continue;
+      }
 
       const fetched = await runWithTimeout(
         () =>
@@ -437,7 +451,7 @@ console.log('IMAP SIN FILTROS:', allUids.length);
       failed,
       hasMore: false,
       nextCursor: null,
-      totalMatching: matchingUids.length
+      totalMatching
     };
   } finally {
     if (lock) {
