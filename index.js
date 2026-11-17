@@ -10,9 +10,9 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
-// Estos límites controlan cada descarga IMAP, no el total de la respuesta.
+// Estos límites controlan el tamaño de página y cada consulta por lotes.
 const DEFAULT_BATCH_SIZE = 20;
-const MAX_BATCH_SIZE = 50;
+const MAX_BATCH_SIZE = 20;
 
 function safeTokenEquals(receivedToken, expectedToken) {
   if (!receivedToken || !expectedToken) {
@@ -333,8 +333,10 @@ async function fetchInboxBatch(config, options = {}) {
       ? Date.parse(`${dateTo}T23:59:59.999Z`)
       : null;
     let totalMatching = 0;
+    const selectedUids = [];
+    let lastExaminedUid = null;
 
-    // Agotar la búsqueda en esta llamada; Base44 no recorre páginas.
+    // Contar coincidencias con metadatos; solo reservar contenido para una página.
     for (let offset = 0; offset < candidateUids.length; offset += batchSize) {
       const batchUids = candidateUids.slice(offset, offset + batchSize);
       const metadata = await runWithTimeout(
@@ -350,13 +352,19 @@ async function fetchInboxBatch(config, options = {}) {
       const metadataByUid = new Map(
         (metadata || []).map((message) => [message.uid, message])
       );
-      const selectedUids = [];
-
       for (const uid of batchUids) {
+        const pageOpen = selectedUids.length < batchSize;
+
+        if (pageOpen) {
+          lastExaminedUid = uid;
+        }
+
         const message = metadataByUid.get(uid);
 
         if (!message) {
-          failed.push({ uid, error: 'Correo no devuelto por IMAP' });
+          if (pageOpen) {
+            failed.push({ uid, error: 'Correo no devuelto por IMAP' });
+          }
           continue;
         }
 
@@ -370,7 +378,9 @@ async function fetchInboxBatch(config, options = {}) {
             : NaN;
 
           if (Number.isNaN(internalTime)) {
-            failed.push({ uid, error: 'Correo sin internalDate válido' });
+            if (pageOpen) {
+              failed.push({ uid, error: 'Correo sin internalDate válido' });
+            }
             continue;
           }
 
@@ -382,15 +392,18 @@ async function fetchInboxBatch(config, options = {}) {
           }
         }
 
-        selectedUids.push(uid);
+        totalMatching += 1;
+
+        if (pageOpen) {
+          selectedUids.push(uid);
+        }
       }
 
-      totalMatching += selectedUids.length;
+      metadataByUid.clear();
+      metadata.length = 0;
+    }
 
-      if (selectedUids.length === 0) {
-        continue;
-      }
-
+    if (selectedUids.length > 0) {
       const fetched = await runWithTimeout(
         () =>
           client.fetchAll(
@@ -415,8 +428,11 @@ async function fetchInboxBatch(config, options = {}) {
         fetchedByUid.set(message.uid, message);
       }
 
+      fetched.length = 0;
+
       for (const uid of selectedUids) {
         const rawMessage = fetchedByUid.get(uid);
+        fetchedByUid.delete(uid);
 
         if (!rawMessage) {
           failed.push({
@@ -442,15 +458,22 @@ async function fetchInboxBatch(config, options = {}) {
             uid,
             error: error.message
           });
+        } finally {
+          // El contenido convertido permanece solo en la respuesta de esta página.
+          rawMessage.source = null;
         }
       }
+
+      fetchedByUid.clear();
     }
+
+    const hasMore = candidateUids[candidateUids.length - 1] < lastExaminedUid;
 
     return {
       messages,
       failed,
-      hasMore: false,
-      nextCursor: null,
+      hasMore,
+      nextCursor: hasMore ? lastExaminedUid : null,
       totalMatching
     };
   } finally {
