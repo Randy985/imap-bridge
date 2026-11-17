@@ -320,11 +320,18 @@ async function fetchInboxBatch(config, options = {}) {
     );
 
     const searchCriteria = buildSearchCriteria({
-      dateFrom,
-      dateTo,
-      cursor,
-      includeRead
-    });
+  dateFrom,
+  dateTo,
+  cursor,
+  includeRead
+});
+
+const allUids = await client.search(
+  { all: true },
+  { uid: true }
+);
+
+console.log('IMAP SIN FILTROS:', allUids.length);
 
     // No existen UID inferiores a 1; evitar el rango IMAP inválido 1:0.
     const uids = cursor === 1 ? [] : await runWithTimeout(
