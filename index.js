@@ -667,10 +667,9 @@ app.listen(PORT, '0.0.0.0', () => {
   );
 
   console.log(
-    `Token: ${
-      SECRET_TOKEN
-        ? 'configurado'
-        : 'NO configurado'
+    `Token: ${SECRET_TOKEN
+      ? 'configurado'
+      : 'NO configurado'
     }`
   );
 });
